@@ -1,9 +1,11 @@
+from io import TextIOWrapper
 import threading
 import time
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -44,8 +46,8 @@ class LSDB:
             auto_compact: To auto compact or not
         """
 
-        self.directory = Path(base_dir)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
 
         self.segment_size = segment_size
         self.compact_threshold = compact_threshold
@@ -55,132 +57,345 @@ class LSDB:
         # Segment management
         self.segments: list[int] = []  # list of segment ids
         self.active_segment_id: int = 0
-        self.active_segment_file = None
+        self.active_segment_file: TextIOWrapper[Any] = None  # type: ignore
         self.active_segment_size: int = 0
 
         # Compaction
-        self.compaction_lock = threading.lock()
+        self.compaction_lock = threading.Lock()
         self.compaction_thread = None
         self.auto_compact = auto_compact
 
         if auto_compact:
-            self._start_compaction()
+            self._start_compaction_thread()
 
-        def _segment_filename(self, segment_id: int) -> Path:
-            """Get filename of segment"""
-            return self.base_dir / f"segment_{segment_id:06d}.log"
+    def _segment_filename(self, segment_id: int) -> Path:
+        """Get filename of segment"""
+        return self.base_dir / f"segment_{segment_id:06d}.log"
 
-        def _load_existing_segments(self) -> None:
-            """Load existing segment files and rebuild index"""
-            segment_files = sorted(self.base_dir.glob("segment_*.log"))
+    def _load_existing_segments(self) -> None:
+        """Load existing segment files and rebuild index"""
+        segment_files = sorted(self.base_dir.glob("segment_*.log"))
 
-            if not segment_files:
-                return
+        if not segment_files:
+            return
 
-            # Extract segment IDs
-            for filepath in segment_files:
-                segment_id = int(filepath.stem.split("_")[1])
-                self.segments.append(segment_id)
+        # Extract segment IDs
+        for filepath in segment_files:
+            segment_id = int(filepath.stem.split("_")[1])
+            self.segments.append(segment_id)
 
-            # Set next segment ID
-            self.active_segment_id = max(self.segments) + 1 if self.segments else 0
+        # Set next segment ID
+        self.active_segment_id = max(self.segments) + 1 if self.segments else 0
 
-            # Rebuild index from all segments
-            self._rebuild_index()
+        # Rebuild index from all segments
+        self._rebuild_index()
 
-        def _rebuild_index(self) -> None:
-            """
-            Rebuild the in-memory index by scanning all segment files.
-            Called on startup for crash recovery.
-            """
+    def _rebuild_index(self) -> None:
+        """
+        Rebuild the in-memory index by scanning all segment files.
+        Called on startup for crash recovery.
+        """
 
-            for segment_id in self.segments:
-                filepath = self._segment_filename(segment_id)
+        for segment_id in self.segments:
+            filepath = self._segment_filename(segment_id)
+
+            with open(filepath, "r") as f:
+                offset = 0
+                for line in f:
+                    if not line.strip():
+                        offset = f.tell()
+                        continue
+
+                    try:
+                        record = json.loads(line)
+                        key = record["key"]
+                        timestamp = record["timestamp"]
+
+                        # Update index (later entries override earlier ones)
+
+                        self.index[key] = IndexEntry(
+                            file_id=segment_id, offset=offset, timestamp=timestamp
+                        )
+
+                        offset = f.tell()
+                    except (json.JSONDecodeError, KeyError):
+                        # Skip corrupted lines
+                        offset = f.tell()
+                        continue
+
+    def _open_active_segment(self) -> None:
+        """Open a new active segment for writing."""
+        filepath = self._segment_filename(self.active_segment_id)
+        self.active_segment_file = open(filepath, "a")
+        self.active_segment_size = filepath.stat().st_size if filepath.exists() else 0
+
+        if self.active_segment_id not in self.segments:
+            self.segments.append(self.active_segment_id)
+
+    def _rotate_segment(self) -> None:
+        """Close current segment and open a new one"""
+        if self.active_segment_file:
+            self.active_segment_file.close()
+
+        self.active_segment_id += 1
+        self._open_active_segment()
+
+    def set(self, key: str, value: str) -> None:
+        """
+        Write a key-value pair.
+
+        Appends a record to the active segment and updates the index.
+        If the segment is full, it rotates to a new segment
+
+        Args:
+            key: The key to write
+            value: The value to write
+        """
+
+        # Create record
+        record: dict[str, any] = {
+            "key": key,
+            "value": value,
+            "timestamp": time.time(),
+        }
+
+        # serialize to JSON
+
+        line = json.dumps(record) + "\n"
+
+        # Get offset before write
+        offset = self.active_segment_file.tell()
+
+        # Write to file
+        self.active_segment_file.write(line)
+        self.active_segment_file.flush()  # Ensure durable
+        os.fsync(self.active_segment_file.fileno())  # force to disk
+
+        # Update the index
+        self.index[key] = IndexEntry(
+            file_id=self.active_segment_id,
+            offset=offset,
+            timestamp=record["timestamp"],  # pyright: ignore[reportUnknownArgumentType]
+        )
+
+        # Update segment size
+        self.active_segment_size += len(line.encode("utf-8"))
+
+        # Rotate segment if needed
+        if self._active_segment_size >= self.segment_size:  # type: ignore
+            self._rotate_segment()
+
+            # Trigger compaction if needed
+            if self.auto_compact and len(self.segments) >= self.compact_threshold:
+                self._trigger_compaction()
+
+    def get(self, key: str) -> str | None:
+        """
+        Read a value by key
+
+        This uses hash index for O(1) lookup, then seeks to the
+        file position to read the value
+
+
+        Args:
+            key: The key to read
+
+        Returns:
+            The value or None if not found or deleted
+
+        """
+
+        if key not in self.index:
+            return None
+
+        entry = self.index[key]
+        filepath = self._segment_filename(entry.file_id)
+
+        with open(filepath, "r") as f:
+            f.seek(entry.offset)
+            line = f.readline()
+
+            try:
+                record = json.loads(line)
+                value = record["value"]
+
+                return value if value else None
+            except (json.JSONDecodeError, KeyError):
+                return None
+
+    def delete(self, key: str) -> None:
+        """
+        Delete a key by writing a tombstone
+
+
+        No need to remove key from index or file.
+        Just write an empty value that is remove during compaction.
+
+        """
+
+        self.set(key, "")
+
+    def compact(self) -> None:
+        """
+        Compact all segments by merging them and removing deleted/old entries
+
+        Algorithm:
+        1. Collect all live key-value paris from all segments
+        2. Write them to new segment files
+        3. Atomically replace old segments with new ones
+        4. Rebuild the index
+        """
+
+        with self.compaction_lock:
+            print(f"Starting compaction of {len(self.segments)} segments...")
+            start_time = time.time()
+
+            # collect all live entries (most recent value for each key)
+            # key => (value, timestamp)
+            live_data: dict[str, tuple[str, float]] = {}
+
+            for key, entry in self.index.items():
+                filepath = self._segment_filename(entry.file_id)
 
                 with open(filepath, "r") as f:
-                    offset = 0
-                    for line in f:
-                        if not line.strip():
-                            offset = f.tell()
-                            continue
+                    f.seek(entry.offset)
+                    line = f.readline()
 
-                        try:
-                            record = json.loads(line)
-                            key = record["key"]
-                            timestamp = record["timestamp"]
+                    try:
+                        record = json.loads(line)
+                        value = record["value"]
+                        timestamp = record["timestamp"]
 
-                            # Update index (later entries override earlier ones)
+                        # skip tombstones (deleted keys)
+                        if value:
+                            live_data[key] = (value, timestamp)
+                    except (json.JSONDecodeError, KeyError):
+                        continue
 
-                            self.index[key] = IndexEntry(
-                                file_id=segment_id, offset=offset, timestamp=timestamp
-                            )
+            # write to new compacted segment
+            compacted_id = max(self.segments) + 1
+            compacted_path = self._segment_filename(compacted_id)
+            new_index: dict[str, IndexEntry] = {}
 
-                            offset = f.tell()
-                        except (json.JSONDecodeError, KeyError):
-                            # Skip corrupted lines
-                            offset = f.tell()
-                            continue
+            with open(compacted_path, "w") as f:
+                for key, (value, timestamp) in sorted(live_data.items()):
+                    offset = f.tell()
 
-        def _open_active_segment(self) -> None:
-            """Open a new active segment for writing."""
-            filepath = self._segment_filename(self.active_segment_id)
-            self.active_segment_file = open(filepath, "a")
-            self.active_segment_size = (
-                filepath.stat().st_size if filepath.exists() else 0
-            )
+                    record = {
+                        "key": key,
+                        "value": value,
+                        "timestamp": timestamp,
+                    }
+                    line = json.dumps(record) + "\n"
+                    f.write(line)
 
-            if self.active_segment_id not in self.segments:
-                self.segments.append(self.active_segment_id)
+                    new_index[key] = IndexEntry(
+                        file_id=compacted_id, offset=offset, timestamp=timestamp
+                    )
 
-        def _rotate_segment(self) -> None:
-            """Close current segment and open a new one"""
+            # close active segment
             if self.active_segment_file:
                 self.active_segment_file.close()
 
-            self.active_segment_id += 1
+            # remove old segments
+            for segment_id in self.segments:
+                filepath = self._segment_filename(segment_id)
+                filepath.unlink()
+
+            # update state
+            self.segments = [compacted_id]
+            self.index = new_index
+            self.active_segment_id = compacted_id + 1
             self._open_active_segment()
 
-        def set(self, key: str, value: str) -> None:
-            """
-            Write a key-value pair.
+            elapsed_time = time.time() - start_time
+            print(f"Compaction completed in {elapsed_time:.2f}s")
+            print(f"Reduced to 1 segment with {len(live_data)} live keys")
 
-            Appends a record to the active segment and updates the index.
-            If the segment is full, it rotates to a new segment
+    def _trigger_compaction(self) -> None:
+        """Trigger compaction in background thread."""
+        if self.compaction_thread and self.compaction_thread.is_alive():
+            return  # Already compacting
 
-            Args:
-                key: The key to write
-                value: The value to write
-            """
+        self.compaction_thread = threading.Thread(target=self.compact)
+        self.compaction_thread.start()
 
-            # Create record
-            record = {"key": key, "value": value, "timestamp": time.time()}
+    def _start_compaction_thread(self) -> None:
+        """Start background compaction thread."""
 
-            # serialize to JSON
+        def compact_periodically():
+            while self.auto_compact:
+                time.sleep(10)  # Check every 10 seconds
+                if len(self.segments) >= self.compact_threshold:
+                    self.compact()
 
-            line = json.dumps(record) + "\n"
+        thread = threading.Thread(target=compact_periodically, daemon=True)
+        thread.start()
 
-            # Get offset before write
-            offset = self.active_segment_file.tell()
+    def keys(self) -> list[str]:
+        """Return all keys (including deleted ones)."""
+        return list(self.index.keys())
 
-            # Write to file
-            self.active_segment_file.write(line)
-            self.active_segment_file.flush()  # Ensure durable
-            os.fsync(self.active_segment_file.fileno())  # force to disk
+    def stats(self) -> dict:
+        """Return statistics about the database."""
+        total_size = sum(
+            self._segment_filename(sid).stat().st_size for sid in self.segments
+        )
 
-            # Update the index
-            self.index[key] = IndexEntry(
-                file_id=self.active_segment_id,
-                offset=offset,
-                timestamp=record["timestamp"],
-            )
+        return {
+            "num_segments": len(self.segments),
+            "num_keys": len(self.index),
+            "total_size_bytes": total_size,
+            "active_segment_size": self.active_segment_size,
+        }
 
-            # Update segment size
-            self.active_segment_size += len(line.encode("utf-8"))
+    def close(self) -> None:
+        """Close the database."""
+        self.auto_compact = False
+        if self.active_segment_file:
+            self.active_segment_file.close()
+        if self.compaction_thread:
+            self.compaction_thread.join(timeout=5)
 
-            # Rotate segment if needed
-            if self._active_segment_size >= self.segment_size:
-                self._rotate_segment()
 
-                # Trigger compaction if needed
-                if self.auto_compact and len(self.segments) >= self.compact_threshold:
-                    self._trigger_compaction()
+if __name__ == "__main__":
+    # Demo usage
+    print("Log-Structured Storage Engine Demo\n")
+
+    # Create database
+    db = LSDB(base_dir="./demo_data", segment_size=1024)
+
+    # Write some data
+    print("Writing data...")
+    for i in range(100):
+        db.set(f"user:{i}", f'{{"name": "User{i}", "age": {20 + i}}}')
+
+    # Read some data
+    print("\nReading data...")
+    print(f"user:0 = {db.get('user:0')}")
+    print(f"user:50 = {db.get('user:50')}")
+
+    # Update a key
+    print("\nUpdating user:0...")
+    db.set("user:0", '{"name": "Alice", "age": 30}')
+    print(f"user:0 = {db.get('user:0')}")
+
+    # Delete a key
+    print("\nDeleting user:50...")
+    db.delete("user:50")
+    print(f"user:50 = {db.get('user:50')}")
+
+    # Show stats
+    print("\nDatabase stats:")
+    for key, value in db.stats().items():
+        print(f"  {key}: {value}")
+
+    # Compact
+    print("\nTriggering compaction...")
+    db.compact()
+
+    print("\nStats after compaction:")
+    for key, value in db.stats().items():
+        print(f"  {key}: {value}")
+
+    db.close()
