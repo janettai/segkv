@@ -1,10 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "lsdb"
 version = "0.1.0"
-description = "Add your description here"
+description = "A log-structured storage engine with compaction for Python"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = []
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Nana Adjei Manu" }
+]
+keywords = [
+    "database",
+    "storage",
+    "log-structured",
+    "key-value",
+    "lsm",
+    "embedded",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/nanaadjeimanu/lsdb"
+Repository = "https://github.com/nanaadjeimanu/lsdb"
+Issues = "https://github.com/nanaadjeimanu/lsdb/issues"
 
 [dependency-groups]
 dev = [
@@ -17,3 +52,11 @@ dev = [
     "pytest>=9.0.2",
     "ruff>=0.14.10",
 ]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/lsdb",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lsdb"]
