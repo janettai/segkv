@@ -48,7 +48,7 @@ jobs:
         run: uv sync --dev
 
       - name: Run mypy
-        run: uv run mypy lsdb
+        run: uv run mypy segkv
 
   test:
     name: Test (Python ${{ matrix.python-version }})
