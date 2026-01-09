@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "lsdb"
+name = "segkv"
 version = "0.1.0"
 description = "A log-structured storage engine with compaction for Python"
 readme = "README.md"
@@ -37,9 +37,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nanaadjeimanu/lsdb"
-Repository = "https://github.com/nanaadjeimanu/lsdb"
-Issues = "https://github.com/nanaadjeimanu/lsdb/issues"
+Homepage = "https://github.com/janettai/segkv"
+Repository = "https://github.com/janettai/segkv"
+Issues = "https://github.com/janettai/segkv/issues"
 
 [dependency-groups]
 dev = [
@@ -50,11 +50,11 @@ dev = [
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/lsdb",
+    "/segkv",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["lsdb"]
+packages = ["segkv"]
 
 [tool.ruff]
 target-version = "py310"
@@ -78,7 +78,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["lsdb"]
+known-first-party = ["segkv"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -92,4 +92,4 @@ no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_configs = true
 show_error_codes = true
-files = ["lsdb"]
+files = ["segkv"]

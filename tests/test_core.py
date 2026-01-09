@@ -2,7 +2,7 @@ import tempfile
 
 import pytest
 
-from lsdb import LSDB
+from segkv import LSDB
 
 
 @pytest.fixture
