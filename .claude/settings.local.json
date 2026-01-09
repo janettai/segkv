@@ -7,7 +7,11 @@
       "Bash(python -m lsdb.core:*)",
       "Bash(python -m pyright:*)",
       "Bash(source .venv/bin/activate)",
-      "Bash(python -m mypy:*)"
+      "Bash(python -m mypy:*)",
+      "Bash(tar:*)",
+      "Bash(uv run ruff:*)",
+      "Bash(uv run:*)",
+      "Bash(uv lock:*)"
     ]
   }
 }

@@ -1,9 +1,9 @@
-from io import TextIOWrapper
-import threading
-import time
 import json
 import os
+import threading
+import time
 from dataclasses import dataclass
+from io import TextIOWrapper
 from pathlib import Path
 from typing import Any
 
@@ -106,7 +106,7 @@ class LSDB:
         for segment_id in self.segments:
             filepath = self._segment_filename(segment_id)
 
-            with open(filepath, "r") as f:
+            with open(filepath) as f:
                 offset = 0
                 for line in f:
                     if not line.strip():
@@ -133,7 +133,7 @@ class LSDB:
     def _open_active_segment(self) -> None:
         """Open a new active segment for writing."""
         filepath = self._segment_filename(self.active_segment_id)
-        self.active_segment_file = open(filepath, "a")
+        self.active_segment_file = open(filepath, "a")  # noqa: SIM115
         self.active_segment_size = filepath.stat().st_size if filepath.exists() else 0
 
         if self.active_segment_id not in self.segments:
@@ -220,7 +220,7 @@ class LSDB:
 
         # File read outside lock to reduce contention
         try:
-            with open(filepath, "r") as f:
+            with open(filepath) as f:
                 f.seek(entry.offset)
                 line = f.readline()
 
@@ -270,7 +270,7 @@ class LSDB:
                 filepath = self._segment_filename(entry.file_id)
 
                 try:
-                    with open(filepath, "r") as f:
+                    with open(filepath) as f:
                         f.seek(entry.offset)
                         line = f.readline()
 
