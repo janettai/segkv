@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# MkDocs build output
+site/
+
+# macOS
+.DS_Store
