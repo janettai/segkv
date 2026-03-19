@@ -1,11 +1,17 @@
 import json
+import logging
 import os
 import threading
 import time
 from dataclasses import dataclass
 from io import TextIOWrapper
 from pathlib import Path
+from types import TracebackType
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["LSDB", "IndexEntry"]
 
 
 @dataclass
@@ -42,8 +48,8 @@ class LSDB:
         Args:
             base_dir: Where to store the data
             segment_size: Max size of each segment file (bytes)
-            compact_threshold: Number of segments before compaction
             auto_compact: To auto compact or not
+            compact_threshold: Number of segments before compaction
         """
 
         self.base_dir = Path(base_dir)
@@ -64,6 +70,7 @@ class LSDB:
         self._lock = threading.RLock()  # Protects index and segment state
         self.compaction_lock = threading.Lock()
         self.compaction_thread: threading.Thread | None = None
+        self._periodic_compaction_thread: threading.Thread | None = None
         self._shutdown_event = threading.Event()
         self.auto_compact = auto_compact
         self._closed = False
@@ -74,6 +81,17 @@ class LSDB:
 
         if auto_compact:
             self._start_compaction_thread()
+
+    def __enter__(self) -> "LSDB":
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def _segment_filename(self, segment_id: int) -> Path:
         """Get filename of segment"""
@@ -106,11 +124,13 @@ class LSDB:
         for segment_id in self.segments:
             filepath = self._segment_filename(segment_id)
 
-            with open(filepath) as f:
-                offset = 0
-                for line in f:
+            with open(filepath, encoding="utf-8") as f:
+                while True:
+                    offset = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
                     if not line.strip():
-                        offset = f.tell()
                         continue
 
                     try:
@@ -118,23 +138,17 @@ class LSDB:
                         key = record["key"]
                         timestamp = record["timestamp"]
 
-                        # Update index (later entries override earlier ones)
-
                         self.index[key] = IndexEntry(
                             file_id=segment_id, offset=offset, timestamp=timestamp
                         )
-
-                        offset = f.tell()
                     except (json.JSONDecodeError, KeyError):
-                        # Skip corrupted lines
-                        offset = f.tell()
                         continue
 
     def _open_active_segment(self) -> None:
         """Open a new active segment for writing."""
         filepath = self._segment_filename(self.active_segment_id)
-        self.active_segment_file = open(filepath, "a")  # noqa: SIM115
-        self.active_segment_size = filepath.stat().st_size if filepath.exists() else 0
+        self.active_segment_file = open(filepath, "a", encoding="utf-8")  # noqa: SIM115
+        self.active_segment_size = filepath.stat().st_size
 
         if self.active_segment_id not in self.segments:
             self.segments.append(self.active_segment_id)
@@ -173,7 +187,7 @@ class LSDB:
             line = json.dumps(record) + "\n"
 
             # Get offset before write
-            offset = self.active_segment_file.tell()
+            offset = self.active_segment_size
 
             # Write to file
             self.active_segment_file.write(line)
@@ -218,117 +232,203 @@ class LSDB:
             entry = self.index[key]
             filepath = self._segment_filename(entry.file_id)
 
-        # File read outside lock to reduce contention
-        try:
-            with open(filepath) as f:
-                f.seek(entry.offset)
-                line = f.readline()
+            try:
+                with open(filepath, encoding="utf-8") as f:
+                    f.seek(entry.offset)
+                    line = f.readline()
 
-            record = json.loads(line)
-            value = record["value"]
-            return value if value else None
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
-            return None
+                record = json.loads(line)
+                value = record["value"]
+                return None if value == "" else value
+            except (json.JSONDecodeError, KeyError, FileNotFoundError):
+                return None
 
     def delete(self, key: str) -> None:
         """
-        Delete a key by writing a tombstone
-
+        Delete a key by writing a tombstone.
 
         No need to remove key from index or file.
         Just write an empty value that is removed during compaction.
-
         """
 
         self.set(key, "")
+
+    def _collect_live_data(
+        self, index_snapshot: dict[str, IndexEntry]
+    ) -> dict[str, tuple[str, float]]:
+        """Read live (non-tombstone) values for all keys in the snapshot."""
+        live_data: dict[str, tuple[str, float]] = {}
+
+        for key, entry in index_snapshot.items():
+            filepath = self._segment_filename(entry.file_id)
+            try:
+                with open(filepath, encoding="utf-8") as f:
+                    f.seek(entry.offset)
+                    line = f.readline()
+                record = json.loads(line)
+                value = record["value"]
+                timestamp = record["timestamp"]
+                if value != "":
+                    live_data[key] = (value, timestamp)
+            except (json.JSONDecodeError, KeyError, FileNotFoundError):
+                continue
+
+        return live_data
+
+    def _write_compacted_segment(
+        self,
+        compacted_path: Path,
+        compacted_id: int,
+        live_data: dict[str, tuple[str, float]],
+    ) -> dict[str, IndexEntry]:
+        """Write live data to a new compacted segment file."""
+        new_index: dict[str, IndexEntry] = {}
+
+        with open(compacted_path, "w", encoding="utf-8") as f:
+            for key, (value, timestamp) in sorted(live_data.items()):
+                offset = f.tell()
+                record = {
+                    "key": key,
+                    "value": value,
+                    "timestamp": timestamp,
+                }
+                line = json.dumps(record) + "\n"
+                f.write(line)
+                new_index[key] = IndexEntry(
+                    file_id=compacted_id, offset=offset, timestamp=timestamp
+                )
+
+        return new_index
+
+    def _read_record_value(self, entry: IndexEntry) -> tuple[str, float] | None:
+        """Read a single record's value and timestamp from disk."""
+        filepath = self._segment_filename(entry.file_id)
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                f.seek(entry.offset)
+                line = f.readline()
+            record = json.loads(line)
+            return record["value"], record["timestamp"]
+        except (json.JSONDecodeError, KeyError, FileNotFoundError):
+            return None
+
+    def _merge_post_snapshot_writes(
+        self,
+        compacted_path: Path,
+        compacted_id: int,
+        new_index: dict[str, IndexEntry],
+        index_snapshot: dict[str, IndexEntry],
+        segments_to_delete: set[int],
+    ) -> None:
+        """Merge writes that occurred after the snapshot into the compacted segment.
+
+        Handles new keys, updated keys, and deletions that happened
+        while compaction was in progress.
+        """
+        compacted_size = compacted_path.stat().st_size
+
+        for key, entry in self.index.items():
+            snapshot_entry = index_snapshot.get(key)
+            if snapshot_entry is not None and entry == snapshot_entry:
+                # Unchanged since snapshot — compacted value is correct
+                continue
+
+            if entry.file_id in segments_to_delete:
+                # Post-snapshot write landed on a doomed segment — rescue it
+                result = self._read_record_value(entry)
+                if result is None:
+                    continue
+                val, ts = result
+                if val != "":
+                    line = (
+                        json.dumps({"key": key, "value": val, "timestamp": ts}) + "\n"
+                    )
+                    line_bytes = line.encode("utf-8")
+                    with open(compacted_path, "a", encoding="utf-8") as f:
+                        f.write(line)
+                    new_index[key] = IndexEntry(
+                        file_id=compacted_id,
+                        offset=compacted_size,
+                        timestamp=ts,
+                    )
+                    compacted_size += len(line_bytes)
+                else:
+                    # Tombstone written after snapshot — remove from compacted
+                    new_index.pop(key, None)
+            else:
+                # Entry on a segment that survives — prefer current value
+                new_index[key] = entry
 
     def compact(self) -> None:
         """
         Compact all segments by merging them and removing deleted/old entries.
 
         Algorithm:
-        1. Collect all live key-value pairs from all segments
-        2. Write them to new segment files
-        3. Atomically replace old segments with new ones
-        4. Rebuild the index
+        1. Snapshot current index and segment list
+        2. Collect live key-value pairs from the snapshot
+        3. Under lock: write compacted segment, merge post-snapshot writes,
+           delete old segments, and swap state atomically
         """
         with self.compaction_lock:
-            # Snapshot current state under lock
             with self._lock:
                 if not self.segments:
                     return
                 index_snapshot = dict(self.index)
                 segments_snapshot = self.segments.copy()
 
-            print(f"Starting compaction of {len(segments_snapshot)} segments...")
+            logger.info("Starting compaction of %d segments...", len(segments_snapshot))
             start_time = time.time()
 
-            # Collect all live entries (most recent value for each key)
-            live_data: dict[str, tuple[str, float]] = {}
+            live_data = self._collect_live_data(index_snapshot)
 
-            for key, entry in index_snapshot.items():
-                filepath = self._segment_filename(entry.file_id)
-
-                try:
-                    with open(filepath) as f:
-                        f.seek(entry.offset)
-                        line = f.readline()
-
-                    record = json.loads(line)
-                    value = record["value"]
-                    timestamp = record["timestamp"]
-
-                    # Skip tombstones (deleted keys)
-                    if value:
-                        live_data[key] = (value, timestamp)
-                except (json.JSONDecodeError, KeyError, FileNotFoundError):
-                    continue
-
-            # Write to new compacted segment
-            compacted_id = max(segments_snapshot) + 1
-            compacted_path = self._segment_filename(compacted_id)
-            new_index: dict[str, IndexEntry] = {}
-
-            with open(compacted_path, "w") as f:
-                for key, (value, timestamp) in sorted(live_data.items()):
-                    offset = f.tell()
-
-                    record = {
-                        "key": key,
-                        "value": value,
-                        "timestamp": timestamp,
-                    }
-                    line = json.dumps(record) + "\n"
-                    f.write(line)
-
-                    new_index[key] = IndexEntry(
-                        file_id=compacted_id, offset=offset, timestamp=timestamp
-                    )
-
-            # Atomically update state under lock
             with self._lock:
-                # Close active segment
+                # Compute compacted_id under lock so it can't collide with
+                # segments created by concurrent writes after the snapshot.
+                compacted_id = max(self.segments) + 1
+                compacted_path = self._segment_filename(compacted_id)
+
+                new_index = self._write_compacted_segment(
+                    compacted_path, compacted_id, live_data
+                )
+
+                segments_to_delete = set(segments_snapshot)
+
+                self._merge_post_snapshot_writes(
+                    compacted_path,
+                    compacted_id,
+                    new_index,
+                    index_snapshot,
+                    segments_to_delete,
+                )
+
                 if self.active_segment_file:
                     self.active_segment_file.close()
 
-                # Remove old segments
                 for segment_id in segments_snapshot:
                     filepath = self._segment_filename(segment_id)
                     if filepath.exists():
                         filepath.unlink()
 
-                # Update state
-                self.segments = [compacted_id]
+                # Preserve segments created after the snapshot
+                surviving = [
+                    sid
+                    for sid in self.segments
+                    if sid not in segments_to_delete and sid != compacted_id
+                ]
+                self.segments = [compacted_id] + surviving
                 self.index = new_index
-                self.active_segment_id = compacted_id + 1
+                self.active_segment_id = max(self.segments) + 1
                 self._open_active_segment()
 
             elapsed_time = time.time() - start_time
-            print(f"Compaction completed in {elapsed_time:.2f}s")
-            print(f"Reduced to 1 segment with {len(live_data)} live keys")
+            logger.info("Compaction completed in %.2fs", elapsed_time)
+            logger.info("Reduced to 1 segment with %d live keys", len(live_data))
 
     def _trigger_compaction(self) -> None:
         """Trigger compaction in background thread."""
+        # TOCTOU: compaction_thread could finish between the check and the
+        # assignment below.  This is benign — at worst we skip one cycle or
+        # start a redundant (but lock-protected) compaction.
         if self.compaction_thread and self.compaction_thread.is_alive():
             return  # Already compacting
 
@@ -396,6 +496,12 @@ class LSDB:
         # Wait for any running compaction to finish
         if self.compaction_thread and self.compaction_thread.is_alive():
             self.compaction_thread.join(timeout=5)
+
+        if (
+            self._periodic_compaction_thread
+            and self._periodic_compaction_thread.is_alive()
+        ):
+            self._periodic_compaction_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

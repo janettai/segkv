@@ -1,4 +1,7 @@
-def main():
+"""Entry point for the lsdb package."""
+
+
+def main() -> None:
     print("Hello from lsdb!")
 
 

@@ -1,4 +1,7 @@
 import tempfile
+import threading
+import time
+from unittest.mock import patch
 
 import pytest
 
@@ -9,9 +12,8 @@ from segkv import LSDB
 def db():
     """Create a temporary database for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        db = LSDB(base_dir=tmpdir, segment_size=1024, auto_compact=False)
-        yield db
-        db.close()
+        with LSDB(base_dir=tmpdir, segment_size=1024, auto_compact=False) as db:
+            yield db
 
 
 class TestBasicOperations:
@@ -42,6 +44,18 @@ class TestBasicOperations:
         assert db.get("key1") == "value1"
         assert db.get("key2") == "value2"
         assert db.get("key3") == "value3"
+
+    def test_get_falsy_values(self, db):
+        """C1: Falsy string values like '0', 'false', '[]' must not be treated as None."""
+        db.set("zero", "0")
+        db.set("false", "false")
+        db.set("empty_list", "[]")
+        db.set("deleted", "")
+
+        assert db.get("zero") == "0"
+        assert db.get("false") == "false"
+        assert db.get("empty_list") == "[]"
+        assert db.get("deleted") is None
 
 
 class TestKeys:
@@ -82,20 +96,17 @@ class TestSegmentRotation:
     def test_segment_rotation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Use tiny segment size to trigger rotation
-            db = LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False)
+            with LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False) as db:
+                # Write enough data to trigger rotation
+                for i in range(10):
+                    db.set(f"key{i}", f"value{i}" * 10)
 
-            # Write enough data to trigger rotation
-            for i in range(10):
-                db.set(f"key{i}", f"value{i}" * 10)
+                # Should have multiple segments
+                assert len(db.segments) > 1
 
-            # Should have multiple segments
-            assert len(db.segments) > 1
-
-            # Data should still be retrievable
-            assert db.get("key0") == "value0" * 10
-            assert db.get("key9") == "value9" * 10
-
-            db.close()
+                # Data should still be retrievable
+                assert db.get("key0") == "value0" * 10
+                assert db.get("key9") == "value9" * 10
 
 
 class TestCompaction:
@@ -103,55 +114,126 @@ class TestCompaction:
 
     def test_compact_removes_deleted_keys(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False)
+            with LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False) as db:
+                # Write and delete some keys
+                for i in range(5):
+                    db.set(f"key{i}", f"value{i}")
 
-            # Write and delete some keys
-            for i in range(5):
-                db.set(f"key{i}", f"value{i}")
+                db.delete("key2")
+                db.delete("key4")
 
-            db.delete("key2")
-            db.delete("key4")
+                db.compact()
 
-            db.compact()
+                # Deleted keys should be gone
+                assert db.get("key2") is None
+                assert db.get("key4") is None
 
-            # Deleted keys should be gone
-            assert db.get("key2") is None
-            assert db.get("key4") is None
-
-            # Other keys should remain
-            assert db.get("key0") == "value0"
-            assert db.get("key1") == "value1"
-            assert db.get("key3") == "value3"
-
-            db.close()
+                # Other keys should remain
+                assert db.get("key0") == "value0"
+                assert db.get("key1") == "value1"
+                assert db.get("key3") == "value3"
 
     def test_compact_keeps_latest_value(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False)
+            with LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False) as db:
+                # Update same key multiple times
+                db.set("key1", "old")
+                db.set("key1", "newer")
+                db.set("key1", "newest")
 
-            # Update same key multiple times
-            db.set("key1", "old")
-            db.set("key1", "newer")
-            db.set("key1", "newest")
+                db.compact()
 
-            db.compact()
+                assert db.get("key1") == "newest"
 
-            assert db.get("key1") == "newest"
-            db.close()
+    def test_compact_preserves_falsy_values(self):
+        """C1: Compaction must not discard falsy values like '0'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False) as db:
+                db.set("zero", "0")
+                db.set("false", "false")
+                db.set("deleted", "")
+
+                db.compact()
+
+                assert db.get("zero") == "0"
+                assert db.get("false") == "false"
+                assert db.get("deleted") is None
+
+    def test_concurrent_write_during_compaction(self):
+        """C2: New keys, updates, and deletes during compaction must not be lost.
+
+        Injects a pause between _collect_live_data and the final merge so
+        that concurrent writes land after the snapshot but before the swap.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with LSDB(base_dir=tmpdir, segment_size=100, auto_compact=False) as db:
+                # Write initial data across multiple segments
+                for i in range(20):
+                    db.set(f"key{i}", f"value{i}")
+
+                # key to be updated and key to be deleted during compaction
+                db.set("will_update", "old")
+                db.set("will_delete", "exists")
+
+                barrier = threading.Barrier(2, timeout=5)
+                original_collect = db._collect_live_data
+
+                def slow_collect(index_snapshot):
+                    """Pause after collecting so the main thread can write."""
+                    result = original_collect(index_snapshot)
+                    barrier.wait()  # signal main thread to start writing
+                    time.sleep(0.2)  # give writes time to land
+                    return result
+
+                def run_compact():
+                    with patch.object(db, "_collect_live_data", slow_collect):
+                        db.compact()
+
+                compact_thread = threading.Thread(target=run_compact)
+                compact_thread.start()
+
+                # Wait until snapshot is taken and collection is done
+                barrier.wait()
+
+                # Write new keys, update existing, delete existing
+                db.set("new_key", "new_val")
+                db.set("will_update", "new")
+                db.delete("will_delete")
+
+                compact_thread.join(timeout=10)
+
+                # New key must exist
+                assert db.get("new_key") == "new_val"
+                # Updated key must reflect the post-snapshot value
+                assert db.get("will_update") == "new"
+                # Deleted key must stay deleted (not resurrected)
+                assert db.get("will_delete") is None
+                # Original data should still be accessible
+                assert db.get("key0") == "value0"
 
 
 class TestPersistence:
     """Test data persistence across database restarts."""
 
-    @pytest.mark.skip(reason="Bug in _rebuild_index: f.tell() fails inside for loop")
     def test_data_persists_after_restart(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Write data
-            db1 = LSDB(base_dir=tmpdir, auto_compact=False)
-            db1.set("persistent", "data")
-            db1.close()
+            with LSDB(base_dir=tmpdir, auto_compact=False) as db1:
+                db1.set("persistent", "data")
 
             # Reopen and verify
-            db2 = LSDB(base_dir=tmpdir, auto_compact=False)
-            assert db2.get("persistent") == "data"
-            db2.close()
+            with LSDB(base_dir=tmpdir, auto_compact=False) as db2:
+                assert db2.get("persistent") == "data"
+
+    def test_offsets_correct_after_restart(self):
+        """C3: Offsets must be correct even after restarting the database."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with LSDB(base_dir=tmpdir, auto_compact=False) as db1:
+                db1.set("a", "alpha")
+                db1.set("b", "bravo")
+                db1.set("c", "charlie")
+
+            with LSDB(base_dir=tmpdir, auto_compact=False) as db2:
+                assert db2.get("a") == "alpha"
+                assert db2.get("b") == "bravo"
+                assert db2.get("c") == "charlie"
