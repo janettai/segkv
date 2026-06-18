@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "segkv-memory": {
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "examples/mcp_server.py"
+      ]
+    }
+  }
+}
