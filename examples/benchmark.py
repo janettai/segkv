@@ -45,7 +45,43 @@ from memory.store import MemoryStore  # noqa: E402
 StoreFactory = Callable[[str], MemoryStore]
 
 _TYPES = ["user", "feedback", "project", "reference"]
-_WORDS = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega", "vector", "matrix", "kernel", "latency", "throughput", "segment", "compaction", "tombstone", "index", "offset", "recovery"]
+_WORDS = [
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "xi",
+    "omicron",
+    "pi",
+    "rho",
+    "sigma",
+    "tau",
+    "upsilon",
+    "phi",
+    "chi",
+    "psi",
+    "omega",
+    "vector",
+    "matrix",
+    "kernel",
+    "latency",
+    "throughput",
+    "segment",
+    "compaction",
+    "tombstone",
+    "index",
+    "offset",
+    "recovery",
+]
 
 
 def _dir_size_bytes(path: str) -> int:
