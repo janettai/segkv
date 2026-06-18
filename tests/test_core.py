@@ -2,7 +2,8 @@ import tempfile
 
 import pytest
 
-from segkv import LSDB
+from segkv import LSDB, DatabaseLockedError
+from segkv.core import fcntl
 
 
 @pytest.fixture
@@ -57,6 +58,14 @@ class TestKeys:
 
         keys = db.keys()
         assert sorted(keys) == ["a", "b", "c"]
+
+    def test_keys_excludes_deleted(self, db):
+        db.set("a", "1")
+        db.set("b", "2")
+        db.delete("a")
+        keys = db.keys()
+        assert "a" not in keys
+        assert "b" in keys
 
 
 class TestStats:
@@ -143,7 +152,6 @@ class TestCompaction:
 class TestPersistence:
     """Test data persistence across database restarts."""
 
-    @pytest.mark.skip(reason="Bug in _rebuild_index: f.tell() fails inside for loop")
     def test_data_persists_after_restart(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Write data
@@ -154,4 +162,33 @@ class TestPersistence:
             # Reopen and verify
             db2 = LSDB(base_dir=tmpdir, auto_compact=False)
             assert db2.get("persistent") == "data"
+            db2.close()
+
+
+@pytest.mark.skipif(fcntl is None, reason="cross-process lock needs fcntl (POSIX)")
+class TestProcessLock:
+    """Test the cross-process advisory lock."""
+
+    def test_second_open_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db1 = LSDB(base_dir=tmpdir, auto_compact=False)
+            try:
+                with pytest.raises(DatabaseLockedError):
+                    LSDB(base_dir=tmpdir, auto_compact=False)
+            finally:
+                db1.close()
+
+    def test_reopen_after_close(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db1 = LSDB(base_dir=tmpdir, auto_compact=False)
+            db1.close()
+            # Lock released on close, so reopening succeeds
+            db2 = LSDB(base_dir=tmpdir, auto_compact=False)
+            db2.close()
+
+    def test_process_lock_disabled_allows_second_open(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db1 = LSDB(base_dir=tmpdir, auto_compact=False, process_lock=False)
+            db2 = LSDB(base_dir=tmpdir, auto_compact=False, process_lock=False)
+            db1.close()
             db2.close()

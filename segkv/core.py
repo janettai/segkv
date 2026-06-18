@@ -7,6 +7,15 @@ from io import TextIOWrapper
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl  # POSIX-only; used for cross-process advisory locking
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+
+class DatabaseLockedError(RuntimeError):
+    """Raised when the database directory is already held open by another process."""
+
 
 @dataclass
 class IndexEntry:
@@ -35,6 +44,7 @@ class LSDB:
         segment_size: int = 1024 * 1024,
         auto_compact: bool = True,
         compact_threshold: int = 5,
+        process_lock: bool = True,
     ) -> None:
         """
         Init storage engine.
@@ -44,10 +54,19 @@ class LSDB:
             segment_size: Max size of each segment file (bytes)
             compact_threshold: Number of segments before compaction
             auto_compact: To auto compact or not
+            process_lock: Acquire an exclusive cross-process advisory lock on the
+                data directory. The in-memory index is per-process, so two
+                processes writing the same directory would corrupt it; with the
+                lock, the second opener raises DatabaseLockedError instead. Set
+                False only for read-only or test scenarios you know are safe.
         """
 
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+
+        self._lock_file: TextIOWrapper | None = None
+        if process_lock:
+            self._acquire_process_lock()
 
         self.segment_size = segment_size
         self.compact_threshold = compact_threshold
@@ -74,6 +93,38 @@ class LSDB:
 
         if auto_compact:
             self._start_compaction_thread()
+
+    def _acquire_process_lock(self) -> None:
+        """Take an exclusive, non-blocking advisory lock on the data directory.
+
+        No-op on platforms without fcntl (e.g. Windows), where the lock cannot be
+        enforced. Raises DatabaseLockedError if another process holds the lock.
+        """
+        if fcntl is None:  # pragma: no cover - Windows
+            return
+
+        lock_path = self.base_dir / ".lock"
+        lock_file = open(lock_path, "w")  # noqa: SIM115
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            lock_file.close()
+            raise DatabaseLockedError(
+                f"segkv database at {self.base_dir} is already open by another "
+                f"process. The in-memory index is per-process, so concurrent "
+                f"writers would corrupt the data. Use a single owning process "
+                f"(or pass process_lock=False if you know access is safe)."
+            ) from exc
+        self._lock_file = lock_file
+
+    def _release_process_lock(self) -> None:
+        """Release the cross-process advisory lock, if held."""
+        if self._lock_file is None:
+            return
+        if fcntl is not None:  # pragma: no branch
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+        self._lock_file.close()
+        self._lock_file = None
 
     def _segment_filename(self, segment_id: int) -> Path:
         """Get filename of segment"""
@@ -107,27 +158,28 @@ class LSDB:
             filepath = self._segment_filename(segment_id)
 
             with open(filepath) as f:
-                offset = 0
-                for line in f:
+                while True:
+                    offset = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
                     if not line.strip():
-                        offset = f.tell()
                         continue
-
                     try:
                         record = json.loads(line)
                         key = record["key"]
                         timestamp = record["timestamp"]
 
-                        # Update index (later entries override earlier ones)
-
-                        self.index[key] = IndexEntry(
-                            file_id=segment_id, offset=offset, timestamp=timestamp
-                        )
-
-                        offset = f.tell()
+                        if record["value"] == "":
+                            # Tombstone — key was deleted
+                            self.index.pop(key, None)
+                        else:
+                            # Update index (later entries override earlier ones)
+                            self.index[key] = IndexEntry(
+                                file_id=segment_id, offset=offset, timestamp=timestamp
+                            )
                     except (json.JSONDecodeError, KeyError):
                         # Skip corrupted lines
-                        offset = f.tell()
                         continue
 
     def _open_active_segment(self) -> None:
@@ -180,12 +232,15 @@ class LSDB:
             self.active_segment_file.flush()  # Ensure durable
             os.fsync(self.active_segment_file.fileno())  # force to disk
 
-            # Update the index
-            self.index[key] = IndexEntry(
-                file_id=self.active_segment_id,
-                offset=offset,
-                timestamp=record["timestamp"],
-            )
+            # Update the index; tombstones are removed from it
+            if value == "":
+                self.index.pop(key, None)
+            else:
+                self.index[key] = IndexEntry(
+                    file_id=self.active_segment_id,
+                    offset=offset,
+                    timestamp=record["timestamp"],
+                )
 
             # Update segment size
             self.active_segment_size += len(line.encode("utf-8"))
@@ -396,6 +451,9 @@ class LSDB:
         # Wait for any running compaction to finish
         if self.compaction_thread and self.compaction_thread.is_alive():
             self.compaction_thread.join(timeout=5)
+
+        # Release the cross-process lock last, after all writes are flushed
+        self._release_process_lock()
 
 
 if __name__ == "__main__":
