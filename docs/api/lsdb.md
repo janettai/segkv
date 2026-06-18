@@ -14,6 +14,7 @@ LSDB(
     segment_size: int = 1_048_576,
     auto_compact: bool = True,
     compact_threshold: int = 5,
+    process_lock: bool = True,
 )
 ```
 
@@ -23,8 +24,11 @@ LSDB(
 | `segment_size` | `int` | `1048576` (1 MB) | Maximum size in bytes for each segment file before rotation. |
 | `auto_compact` | `bool` | `True` | Whether to run background compaction automatically. |
 | `compact_threshold` | `int` | `5` | Number of segments that triggers automatic compaction. |
+| `process_lock` | `bool` | `True` | Take an exclusive cross-process advisory lock on `base_dir`. See [`DatabaseLockedError`](#databaselockederror). |
 
-On initialization, the engine loads existing segments, rebuilds the in-memory index, and (if `auto_compact` is enabled) starts a background compaction thread.
+On initialization, the engine acquires the process lock, loads existing segments, rebuilds the in-memory index, and (if `auto_compact` is enabled) starts a background compaction thread.
+
+**Raises:** [`DatabaseLockedError`](#databaselockederror) if `process_lock` is enabled and another process already holds `base_dir`.
 
 ## Methods
 
@@ -66,7 +70,7 @@ value = db.get("user:1")  # '{"name": "Alice"}' or None
 def delete(self, key: str) -> None
 ```
 
-Delete a key by writing a tombstone (empty value). The tombstone is removed during compaction.
+Delete a key by writing a tombstone (empty value). The key is removed from the in-memory index immediately; the tombstone record on disk is discarded during compaction.
 
 ```python
 db.delete("user:1")
@@ -81,7 +85,7 @@ db.get("user:1")  # None
 def keys(self) -> list[str]
 ```
 
-Return all keys currently in the index. This includes keys with tombstones that haven't been compacted yet.
+Return all keys currently in the index. Deleted keys are excluded — a tombstone removes the key from the index immediately.
 
 ```python
 all_keys = db.keys()  # ["user:1", "user:2", ...]
@@ -140,12 +144,34 @@ stats = db.stats()
 def close(self) -> None
 ```
 
-Gracefully shut down the database. Signals the background compaction thread to stop, waits for any in-progress compaction to finish (up to 5 seconds), and closes the active segment file.
+Gracefully shut down the database. Signals the background compaction thread to stop, waits for any in-progress compaction to finish (up to 5 seconds), closes the active segment file, and releases the cross-process lock.
 
 Safe to call multiple times.
 
 ```python
 db.close()
+```
+
+## DatabaseLockedError
+
+```python
+class DatabaseLockedError(RuntimeError): ...
+```
+
+Raised by the constructor when `process_lock=True` and another process already holds
+the data directory. The in-memory index is per-process, so concurrent writers would
+corrupt the data; the lock turns that into a clear error instead. A database has one
+owning process at a time — see
+[Performance — cross-process access](../performance.md#concurrency-and-cross-process-access)
+for the recommended sharing patterns.
+
+```python
+from segkv import LSDB, DatabaseLockedError
+
+try:
+    db = LSDB(base_dir="./data")
+except DatabaseLockedError:
+    print("Another process already owns ./data")
 ```
 
 ## IndexEntry

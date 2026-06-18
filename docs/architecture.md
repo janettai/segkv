@@ -65,7 +65,12 @@ def delete(self, key: str) -> None:
     self.set(key, "")
 ```
 
-On read, an empty value is treated as `None` (not found). Tombstones are cleaned up during compaction.
+Writing a tombstone has two effects: the empty-value record is appended to the active
+segment (so the deletion is durable and survives a restart), and the key is
+**immediately removed from the in-memory index**. Because the index no longer holds
+the key, `get()` returns `None` and `keys()` does not list it — no per-read check for
+empty values is required. The tombstone records themselves remain on disk until
+[compaction](#compaction) discards them.
 
 ## Compaction
 
@@ -89,9 +94,16 @@ Compaction holds a separate `compaction_lock` to prevent concurrent compactions.
 
 On startup, `_rebuild_index()` replays **all** segment files from oldest to newest:
 
-1. For each segment, read every JSON line
-2. Update the index with each record's key, file position, and timestamp
-3. Later records for the same key naturally overwrite earlier ones
+1. For each segment, read every JSON line, recording the byte offset of each line
+2. For a normal record, update the index with the key, file position, and timestamp
+3. For a tombstone (empty value), remove the key from the index
+4. Later records for the same key naturally overwrite (or delete) earlier ones
+
+Offsets are captured with `f.tell()` **before** each `readline()` call rather than by
+iterating the file object directly. Python's line iterator uses a read-ahead buffer
+that makes `f.tell()` report the wrong position mid-iteration, which previously
+produced incorrect offsets after a restart; the explicit `tell()`/`readline()` loop
+fixes that, so `IndexEntry.offset` is accurate across restarts.
 
 Because segments are append-only and flushed with `fsync`, any complete line on disk represents a durable write. Partially written lines (from a crash mid-write) are skipped via `json.JSONDecodeError` handling.
 
@@ -105,3 +117,11 @@ segkv uses two locks:
 | `compaction_lock` | `threading.Lock` | Prevents concurrent compactions |
 
 A `threading.Event` (`_shutdown_event`) signals the background compaction thread to stop during `close()`.
+
+These locks coordinate threads **within a single process**. The in-memory index is
+also per-process, so two processes opening the same data directory cannot stay
+consistent. To make that failure safe rather than silent, `LSDB` takes an exclusive
+advisory file lock (`<base_dir>/.lock`, via `fcntl.flock`) on open; a second opener
+raises `DatabaseLockedError`. The lock is released in `close()`, and can be disabled
+with `process_lock=False`. On platforms without `fcntl` (e.g. Windows) the lock is a
+no-op. See [Performance — cross-process access](performance.md#concurrency-and-cross-process-access).

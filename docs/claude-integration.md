@@ -1,9 +1,12 @@
 # Claude Integration
 
-segkv can serve as the memory layer for Claude in two ways:
+segkv can serve as the memory layer for Claude in three ways:
 
-1. **Claude Code** — import Claude Code's file-based memories into segkv for querying, backup, and compaction
-2. **Custom Claude agents** — use segkv as the persistent memory backend for agents built with the Claude Agent SDK
+1. **MCP server** — register the bundled stdio server and Claude Code gets five persistent memory tools, no code required. See the dedicated [MCP Server](mcp-server.md) page.
+2. **Claude Code memory import** — import Claude Code's file-based memories into segkv for querying, backup, and compaction
+3. **Custom Claude agents** — use segkv as the persistent memory backend for agents built with the Claude Agent SDK or the raw Anthropic SDK
+
+This page covers (2) and (3); for (1) see [MCP Server](mcp-server.md).
 
 ## With Claude Code
 

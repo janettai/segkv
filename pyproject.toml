@@ -46,6 +46,8 @@ Issues = "https://github.com/janettai/segkv/issues"
 
 [dependency-groups]
 dev = [
+    "anthropic>=0.50.0",
+    "mcp>=1.0.0",
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.5.0",
     "mypy>=1.0.0",
@@ -56,6 +58,8 @@ dev = [
 [tool.hatch.build.targets.sdist]
 include = [
     "/segkv",
+    "/memory",
+    "memory_cli.py",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -31,6 +31,7 @@ segkv ships with three layers:
 | [LSDB](api/lsdb.md) | Core log-structured storage engine |
 | [MemoryStore](api/memory-store.md) | Typed record adapter for structured memory storage |
 | [CLI](cli.md) | Command-line interface for the memory store |
+| [MCP Server](mcp-server.md) | Persistent memory tools for Claude Code over MCP |
 
 ## Requirements
 
