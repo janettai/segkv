@@ -117,3 +117,11 @@ segkv uses two locks:
 | `compaction_lock` | `threading.Lock` | Prevents concurrent compactions |
 
 A `threading.Event` (`_shutdown_event`) signals the background compaction thread to stop during `close()`.
+
+These locks coordinate threads **within a single process**. The in-memory index is
+also per-process, so two processes opening the same data directory cannot stay
+consistent. To make that failure safe rather than silent, `LSDB` takes an exclusive
+advisory file lock (`<base_dir>/.lock`, via `fcntl.flock`) on open; a second opener
+raises `DatabaseLockedError`. The lock is released in `close()`, and can be disabled
+with `process_lock=False`. On platforms without `fcntl` (e.g. Windows) the lock is a
+no-op. See [Performance — cross-process access](performance.md#concurrency-and-cross-process-access).

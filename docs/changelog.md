@@ -23,7 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registration and `--db-path` / `SEGKV_DB_PATH` overrides.
 - **Tool-augmented agent example** (`examples/tool_agent.py`) — a runnable
   Anthropic-SDK agent that uses segkv as persistent memory.
-- Documentation for the memory layer, CLI, MCP server, and Claude integration.
+- **Cross-process safety** — `LSDB` takes an exclusive advisory file lock
+  (`<base_dir>/.lock`) on open and raises `DatabaseLockedError` if another process
+  already holds the directory, since the in-memory index is per-process. Add a
+  `process_lock` constructor flag (default `True`) to opt out. No-op where `fcntl`
+  is unavailable.
+- Benchmark harness (`examples/benchmark.py`) and an in-memory-search prototype
+  (`examples/cached_memory_store.py`).
+- Documentation for the memory layer, CLI, MCP server, Claude integration, and
+  performance characteristics.
 - Ruff and mypy configuration in pyproject.toml
 - GitHub Actions CI/CD workflows for linting, type checking, testing, and publishing
 

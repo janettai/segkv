@@ -50,5 +50,6 @@ nav:
   - CLI Reference: cli.md
   - MCP Server: mcp-server.md
   - Claude Integration: claude-integration.md
+  - Performance: performance.md
   - Configuration: configuration.md
   - Changelog: changelog.md
