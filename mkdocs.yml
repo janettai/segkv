@@ -48,6 +48,7 @@ nav:
       - MemoryStore: api/memory-store.md
       - Migration Utilities: api/migration.md
   - CLI Reference: cli.md
+  - MCP Server: mcp-server.md
   - Claude Integration: claude-integration.md
   - Configuration: configuration.md
   - Changelog: changelog.md
