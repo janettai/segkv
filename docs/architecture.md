@@ -1,5 +1,9 @@
 # Architecture
 
+This page documents the **internals of the storage engine** (`LSDB`). For the
+project-level picture — the layered design, the technology lineage, and how segkv
+serves as the memory substrate of an AI harness — see [Design & Internals](design.md).
+
 ## Overview
 
 segkv is a **log-structured storage engine**. Every write is appended to the end of a log file (called a **segment**), and an in-memory **hash index** maps each key to its location on disk. This design gives durable, sequential writes and O(1) reads.
